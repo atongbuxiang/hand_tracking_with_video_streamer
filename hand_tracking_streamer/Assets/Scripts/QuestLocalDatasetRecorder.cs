@@ -565,7 +565,11 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
             File.Delete(_zipPath);
         }
 
-        ZipFile.CreateFromDirectory(_datasetDirectory, _zipPath, CompressionLevel.Optimal, false);
+        ZipFile.CreateFromDirectory(
+            _datasetDirectory,
+            _zipPath,
+            System.IO.Compression.CompressionLevel.Optimal,
+            false);
     }
 
     private SerializableProjectionDefaults BuildFallbackProjectionDefaults()

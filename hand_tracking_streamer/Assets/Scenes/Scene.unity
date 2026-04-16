@@ -5901,6 +5901,7 @@ MonoBehaviour:
   cameraPreset: 640x480@30
   cameraBitrateKbps: 2500
   videoSignalingPort: 8765
+  localSaveMode: 1
   rayInteractors:
   - {fileID: 1042446427}
   - {fileID: 424537388}
@@ -14814,9 +14815,10 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::QuestCameraUplinkManager
   cameraCapture: {fileID: 1575559086}
-  videoSender: {fileID: 1575559085}
   statsOverlay: {fileID: 0}
   logSource: Left
+  maxFps: 30
+  datasetNamePrefix: quest_local_save
 --- !u!114 &1575559085
 MonoBehaviour:
   m_ObjectHideFlags: 0

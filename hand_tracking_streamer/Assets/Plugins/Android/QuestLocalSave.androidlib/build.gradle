@@ -1,0 +1,11 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace "com.codex.localsave"
+    compileSdkVersion 35
+
+    defaultConfig {
+        minSdkVersion 29
+        targetSdkVersion 35
+    }
+}
