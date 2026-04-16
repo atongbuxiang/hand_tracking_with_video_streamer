@@ -25,6 +25,7 @@ public class HeadPoseStreamer : MonoBehaviour
     private readonly StringBuilder _sbPacket = new StringBuilder(256);
     private readonly StringBuilder _sbLog = new StringBuilder(256);
     private uint _frameId;
+    private QuestLocalDatasetRecorder _localRecorder;
 
     private void Update()
     {
@@ -37,7 +38,7 @@ public class HeadPoseStreamer : MonoBehaviour
             return;
         }
 
-        if (!_isInitialized)
+        if (!AppManager.Instance.UseLocalSaveMode && !_isInitialized)
         {
             InitializeNetwork();
         }
@@ -82,21 +83,45 @@ public class HeadPoseStreamer : MonoBehaviour
         _sbLog.Clear();
 
         bool includeMetadata = AppManager.Instance == null || AppManager.Instance.IncludeStreamMetadata;
+        uint frameId = QuestStreamClock.NextFrameId(ref _frameId);
+        ulong timestampNs = QuestStreamClock.GetMonotonicTimestampNs();
+        _localRecorder = ResolveLocalRecorder();
         if (includeMetadata)
         {
-            uint frameId = QuestStreamClock.NextFrameId(ref _frameId);
             QuestStreamClock.AppendHeaderWithMeta(
                 _sbPacket,
                 "Head",
                 "pose",
                 frameId,
-                QuestStreamClock.GetMonotonicTimestampNs()
+                timestampNs
             );
             _sbPacket.Append(", ");
         }
         else
         {
             _sbPacket.Append("Head pose:, ");
+        }
+
+        if (_localRecorder != null && _localRecorder.IsRecording)
+        {
+            _localRecorder.RecordTelemetry(
+                "head",
+                "pose",
+                unchecked((int)frameId),
+                unchecked((long)timestampNs),
+                includeMetadata
+                    ? QuestStreamClock.BuildLabelWithMeta("Head", "pose", frameId, timestampNs)
+                    : "Head pose",
+                new[]
+                {
+                    position.x,
+                    position.y,
+                    position.z,
+                    rotation.x,
+                    rotation.y,
+                    rotation.z,
+                    rotation.w,
+                });
         }
 
         AppendVector3(_sbPacket, position);
@@ -111,7 +136,10 @@ public class HeadPoseStreamer : MonoBehaviour
             LogHUD(_sbLog.ToString());
         }
 
-        SendData(_sbPacket.ToString());
+        if (AppManager.Instance != null && !AppManager.Instance.UseLocalSaveMode)
+        {
+            SendData(_sbPacket.ToString());
+        }
     }
 
     private void InitializeNetwork()
@@ -245,5 +273,11 @@ public class HeadPoseStreamer : MonoBehaviour
         {
             LogManager.Instance.Log(hudLogSource, msg);
         }
+    }
+
+    private QuestLocalDatasetRecorder ResolveLocalRecorder()
+    {
+        QuestCameraUplinkManager manager = FindFirstObjectByType<QuestCameraUplinkManager>();
+        return manager != null ? manager.DatasetRecorder : null;
     }
 }

@@ -40,4 +40,11 @@ public static class QuestStreamClock
           .Append(timestampNs)
           .Append(":");
     }
+
+    public static string BuildLabelWithMeta(string source, string section, uint frameId, ulong timestampNs)
+    {
+        StringBuilder sb = new StringBuilder(96);
+        AppendHeaderWithMeta(sb, source, section, frameId, timestampNs);
+        return sb.ToString();
+    }
 }
