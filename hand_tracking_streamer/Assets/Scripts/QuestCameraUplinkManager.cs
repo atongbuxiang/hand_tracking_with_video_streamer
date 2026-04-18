@@ -14,20 +14,22 @@ public class QuestCameraUplinkManager : MonoBehaviour
     }
 
     [SerializeField] private QuestCameraCapture cameraCapture;
-    [SerializeField] private QuestVideoSender videoSender;
     [SerializeField] private VideoStatsOverlay statsOverlay;
     [SerializeField] private string logSource = "Left";
-    [SerializeField] private int jpegQuality = 75;
     [SerializeField] private int maxFps = 15;
+    [SerializeField] private string datasetNamePrefix = "quest_local_save";
 
     private SessionState _state = SessionState.Idle;
     private bool _isStopping;
     private float _sendIntervalSeconds = 1f / 15f;
     private float _sendTimer;
-    private int _framesSent;
+    private int _framesSaved;
     private float _fpsWindowStart;
+    private QuestLocalDatasetRecorder _datasetRecorder;
+    private AndroidMp4Recorder _videoRecorder;
 
     public SessionState CurrentState => _state;
+    public QuestLocalDatasetRecorder DatasetRecorder => _datasetRecorder;
 
     public async Task<bool> StartVideoSession(
         string signalingHost,
@@ -37,39 +39,42 @@ public class QuestCameraUplinkManager : MonoBehaviour
         bool showDebugStats
     )
     {
-        if (_state != SessionState.Idle) return false;
+        if (_state != SessionState.Idle)
+        {
+            return false;
+        }
+
         if (cameraCapture == null)
         {
             FailFatal("Camera capture component missing.");
             return false;
         }
-        if (videoSender == null)
+
+        _datasetRecorder = GetComponent<QuestLocalDatasetRecorder>();
+        if (_datasetRecorder == null)
         {
-            FailFatal("Video sender component missing.");
-            return false;
+            _datasetRecorder = gameObject.AddComponent<QuestLocalDatasetRecorder>();
         }
 
+        _videoRecorder = new AndroidMp4Recorder();
         _state = SessionState.CameraInitializing;
         _sendTimer = 0f;
-        _framesSent = 0;
+        _framesSaved = 0;
         _fpsWindowStart = Time.realtimeSinceStartup;
-        statsOverlay?.SetVisible(showDebugStats);
+
+        statsOverlay?.SetVisible(showDebugStats || (AppManager.Instance != null && AppManager.Instance.ShowDebugInfo));
         statsOverlay?.SetPreset(preset);
-        statsOverlay?.SetSignalingState("camera_init");
+        statsOverlay?.SetSignalingState("local_record_init");
         statsOverlay?.SetPeerState("idle");
         statsOverlay?.SetError(string.Empty);
 
         if (AppManager.Instance != null)
         {
             cameraCapture.SetRequestedResolution(AppManager.Instance.RequestedCameraResolution);
-        }
-
-        if (AppManager.Instance != null)
-        {
             maxFps = Mathf.Clamp(AppManager.Instance.RequestedCameraFps, 1, 30);
         }
+
         _sendIntervalSeconds = 1f / Mathf.Max(1, maxFps);
-        jpegQuality = BitrateToJpegQuality(bitrateKbps);
 
         if (!cameraCapture.EnsureInitialized())
         {
@@ -85,65 +90,86 @@ public class QuestCameraUplinkManager : MonoBehaviour
         }
 
         _state = SessionState.Connecting;
-        statsOverlay?.SetSignalingState("connecting");
-        LogInfo($"camera tcp connect {signalingHost}:{signalingPort} preset={preset} jpeg_quality={jpegQuality} fps={maxFps}");
+        statsOverlay?.SetSignalingState("preparing_storage");
 
-        videoSender.OnError += FailFatal;
-        bool connected = videoSender.Connect(signalingHost, signalingPort);
-        if (!connected)
+        string datasetName = $"{datasetNamePrefix}_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+        if (!_datasetRecorder.BeginRecording(datasetName, maxFps, _videoRecorder, out string datasetError))
         {
-            videoSender.OnError -= FailFatal;
-            FailFatal("Camera TCP connection failed.");
+            FailFatal(datasetError);
             return false;
         }
 
-        if (cameraCapture.TryBuildCalibrationMetadataJson(out string calibrationJson, out string calibrationError))
+        string videoPath = _datasetRecorder.VideoOutputPath;
+        if (string.IsNullOrWhiteSpace(videoPath))
         {
-            if (!videoSender.SendMetadataJson(calibrationJson))
-            {
-                videoSender.OnError -= FailFatal;
-                FailFatal("Camera calibration metadata send failed.");
-                return false;
-            }
-            LogInfo("camera calibration metadata sent");
+            FailFatal("Local video path was not created.");
+            return false;
         }
-        else
+
+        int width = Mathf.Max(1, sourceTexture.width);
+        int height = Mathf.Max(1, sourceTexture.height);
+        if (!_videoRecorder.StartRecording(videoPath, width, height, maxFps, out string videoError))
         {
-            LogInfo($"camera calibration metadata unavailable: {calibrationError}");
+            FailFatal(videoError);
+            return false;
+        }
+
+        if (cameraCapture.TryBuildCalibrationMetadata(out QuestCameraCalibrationMetadata calibration, out string calibrationError))
+        {
+            _datasetRecorder.RecordCameraCalibration(calibration);
+            LogInfo("camera calibration captured for local save");
+        }
+        else if (!string.IsNullOrWhiteSpace(calibrationError))
+        {
+            LogInfo($"camera calibration unavailable: {calibrationError}");
         }
 
         _state = SessionState.Streaming;
-        statsOverlay?.SetSignalingState("connected");
+        statsOverlay?.SetSignalingState("recording_local");
         statsOverlay?.SetPeerState("streaming");
         UpdateStatsOverlay(0f);
-        LogInfo("camera tcp sender connected");
+        LogInfo($"local save started path={_datasetRecorder.DatasetDirectory}");
         return true;
     }
 
-    public async Task StopVideoSession(string reason)
+    public Task StopVideoSession(string reason)
     {
-        if (_isStopping) return;
+        if (_isStopping)
+        {
+            return Task.CompletedTask;
+        }
+
         _isStopping = true;
         _state = SessionState.Stopping;
         statsOverlay?.SetSignalingState("stopping");
-        LogInfo($"camera stopping tcp session reason={reason}");
+        LogInfo($"local save stopping reason={reason}");
 
-        if (videoSender != null)
+        try
         {
-            videoSender.OnError -= FailFatal;
-            videoSender.Disconnect();
+            _videoRecorder?.StopRecording();
+        }
+        finally
+        {
+            _videoRecorder?.Dispose();
+            _videoRecorder = null;
+        }
+
+        if (_datasetRecorder != null)
+        {
+            _datasetRecorder.EndRecording();
+            LogInfo($"local save finalized zip={_datasetRecorder.ZipPath}");
         }
 
         statsOverlay?.SetSignalingState("idle");
         statsOverlay?.SetPeerState("idle");
         _state = SessionState.Idle;
         _isStopping = false;
-        LogInfo("camera tcp session stopped");
+        return Task.CompletedTask;
     }
 
     private void Update()
     {
-        if (_state != SessionState.Streaming || cameraCapture == null || videoSender == null)
+        if (_state != SessionState.Streaming || cameraCapture == null || _datasetRecorder == null || _videoRecorder == null)
         {
             return;
         }
@@ -155,9 +181,8 @@ public class QuestCameraUplinkManager : MonoBehaviour
         }
         _sendTimer = 0f;
 
-        if (!cameraCapture.TryEncodeJpegFrame(
-                jpegQuality,
-                out byte[] jpegBytes,
+        if (!cameraCapture.TryReadRgbaFrame(
+                out Color32[] pixels,
                 out uint frameId,
                 out ulong timestampNs,
                 out int width,
@@ -168,34 +193,43 @@ public class QuestCameraUplinkManager : MonoBehaviour
             return;
         }
 
-        if (cameraCapture.TryBuildFramePoseMetadataJson(frameId, timestampNs, out string poseJson, out string poseError))
+        if (cameraCapture.TryBuildFramePoseMetadata(frameId, timestampNs, out QuestCameraFramePoseMetadata pose, out string poseError))
         {
-            if (!videoSender.SendMetadataJson(poseJson))
-            {
-                return;
-            }
+            _datasetRecorder.RecordCameraPose(pose);
         }
         else if (!string.IsNullOrWhiteSpace(poseError))
         {
-            LogDebug($"camera pose metadata unavailable: {poseError}");
+            LogDebug($"camera pose unavailable: {poseError}");
         }
 
-        if (!videoSender.SendFrame(jpegBytes, frameId, timestampNs, width, height))
+        if (!_videoRecorder.AddFrame(pixels, unchecked((long)timestampNs), out string encodeError))
         {
+            FailFatal(encodeError);
             return;
         }
 
-        _framesSent++;
+        _datasetRecorder.RecordCameraFrame(
+            unchecked((int)frameId),
+            unchecked((long)timestampNs),
+            width,
+            height,
+            unchecked((long)QuestStreamClock.GetMonotonicTimestampNs()));
+
+        _framesSaved++;
         float elapsed = Mathf.Max(Time.realtimeSinceStartup - _fpsWindowStart, 0.001f);
-        float fps = _framesSent / elapsed;
+        float fps = _framesSaved / elapsed;
         UpdateStatsOverlay(fps);
     }
 
     private async void FailFatal(string reason)
     {
-        if (string.IsNullOrWhiteSpace(reason)) reason = "Unknown camera uplink failure";
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            reason = "Unknown local save failure";
+        }
+
         statsOverlay?.SetError(reason);
-        LogInfo($"camera fatal: {reason}");
+        LogInfo($"local save fatal: {reason}");
 
         if (_state != SessionState.Idle)
         {
@@ -204,36 +238,42 @@ public class QuestCameraUplinkManager : MonoBehaviour
 
         if (AppManager.Instance != null && AppManager.Instance.isStreaming)
         {
-            AppManager.Instance.HandleDisconnection($"Camera uplink failure: {reason}");
+            AppManager.Instance.HandleDisconnection($"Local save failure: {reason}");
         }
     }
 
     private void LogDebug(string msg)
     {
-        if (LogManager.Instance == null) return;
+        if (LogManager.Instance == null)
+        {
+            return;
+        }
+
         bool shouldLog = AppManager.Instance != null && AppManager.Instance.ShowDebugInfo;
-        if (!shouldLog) return;
+        if (!shouldLog)
+        {
+            return;
+        }
+
         LogManager.Instance.Log(logSource, $"[CameraDebug] {msg}");
     }
 
     private void LogInfo(string msg)
     {
-        if (LogManager.Instance == null) return;
-        LogManager.Instance.Log(logSource, $"[Camera] {msg}");
+        if (LogManager.Instance == null)
+        {
+            return;
+        }
+
+        LogManager.Instance.Log(logSource, $"[LocalSave] {msg}");
     }
 
     private void UpdateStatsOverlay(float fps)
     {
-        float approxBitrate = fps <= 0f || jpegQuality <= 0
+        float approxBitrate = fps <= 0f
             ? 0f
             : (cameraCapture.CurrentResolution.x * cameraCapture.CurrentResolution.y * fps * 0.08f);
         statsOverlay?.SetStats(fps, approxBitrate, 0, -1f);
-    }
-
-    private static int BitrateToJpegQuality(int bitrateKbps)
-    {
-        if (bitrateKbps <= 0) return 75;
-        return Mathf.Clamp(35 + (bitrateKbps / 80), 35, 90);
     }
 
     private async Task<Texture> WaitForCameraTextureAsync(int timeoutMs)

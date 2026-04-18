@@ -257,6 +257,79 @@ public class QuestCameraCapture : MonoBehaviour
         }
     }
 
+    public bool TryReadRgbaFrame(
+        out Color32[] pixels,
+        out uint frameId,
+        out ulong timestampNs,
+        out int width,
+        out int height,
+        out string error
+    )
+    {
+        pixels = null;
+        frameId = 0;
+        timestampNs = 0;
+        width = 0;
+        height = 0;
+        error = string.Empty;
+
+        if (_cameraAccess == null)
+        {
+            error = "Camera access component is not initialized.";
+            return false;
+        }
+
+        if (!GetIsPlaying())
+        {
+            error = "Camera is not yet playing.";
+            return false;
+        }
+
+        Texture sourceTexture = GetLatestTexture();
+        if (sourceTexture == null)
+        {
+            error = "Camera texture is unavailable.";
+            return false;
+        }
+
+        width = sourceTexture.width;
+        height = sourceTexture.height;
+        if (width <= 0 || height <= 0)
+        {
+            error = $"Camera texture has invalid dimensions {width}x{height}.";
+            return false;
+        }
+
+        try
+        {
+            EnsureCpuReadbackTargets(width, height);
+
+            Graphics.Blit(sourceTexture, _cpuReadbackTarget);
+
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture.active = _cpuReadbackTarget;
+            _cpuReadbackTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+            _cpuReadbackTexture.Apply(false, false);
+            RenderTexture.active = previous;
+
+            pixels = _cpuReadbackTexture.GetPixels32();
+            if (pixels == null || pixels.Length == 0)
+            {
+                error = "RGBA readback returned an empty buffer.";
+                return false;
+            }
+
+            frameId = QuestStreamClock.NextFrameId(ref _encodedFrameId);
+            timestampNs = QuestStreamClock.GetMonotonicTimestampNs();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"RGBA frame capture failed: {ex.Message}";
+            return false;
+        }
+    }
+
     public bool TryBuildCalibrationMetadataJson(out string json, out string error)
     {
         json = null;
@@ -329,6 +402,77 @@ public class QuestCameraCapture : MonoBehaviour
         }
     }
 
+    public bool TryBuildCalibrationMetadata(out QuestCameraCalibrationMetadata metadata, out string error)
+    {
+        metadata = null;
+        error = string.Empty;
+
+        if (_cameraAccess == null)
+        {
+            error = "Camera access component is not initialized.";
+            return false;
+        }
+
+        if (!GetIsPlaying())
+        {
+            error = "Camera is not yet playing.";
+            return false;
+        }
+
+        if (_intrinsicsProperty == null)
+        {
+            error = "Passthrough camera intrinsics are not exposed by this MRUK/PCA version.";
+            return false;
+        }
+
+        try
+        {
+            object intrinsics = _intrinsicsProperty.GetValue(_cameraAccess);
+            if (intrinsics == null)
+            {
+                error = "Passthrough camera intrinsics are unavailable.";
+                return false;
+            }
+
+            Type intrinsicsType = intrinsics.GetType();
+            Vector2 focalLength = ReadStructField<Vector2>(intrinsics, intrinsicsType, "FocalLength");
+            Vector2 principalPoint = ReadStructField<Vector2>(intrinsics, intrinsicsType, "PrincipalPoint");
+            Vector2Int sensorResolution = ReadStructField<Vector2Int>(intrinsics, intrinsicsType, "SensorResolution");
+            Pose lensOffset = ReadStructField<Pose>(intrinsics, intrinsicsType, "LensOffset");
+            Vector2Int currentResolution = CurrentResolution;
+
+            metadata = new QuestCameraCalibrationMetadata
+            {
+                camera_eye = cameraEye == CameraEye.Left ? "left" : "right",
+                timestamp_ns = QuestStreamClock.GetMonotonicTimestampNs(),
+                current_resolution = new[] { currentResolution.x, currentResolution.y },
+                sensor_resolution = new[] { sensorResolution.x, sensorResolution.y },
+                focal_length = new[] { focalLength.x, focalLength.y },
+                principal_point = new[] { principalPoint.x, principalPoint.y },
+                lens_offset_position = new[]
+                {
+                    lensOffset.position.x,
+                    lensOffset.position.y,
+                    lensOffset.position.z,
+                },
+                lens_offset_rotation = new[]
+                {
+                    lensOffset.rotation.x,
+                    lensOffset.rotation.y,
+                    lensOffset.rotation.z,
+                    lensOffset.rotation.w,
+                },
+            };
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Camera calibration metadata read failed: {ex.Message}";
+            return false;
+        }
+    }
+
     public bool TryBuildFramePoseMetadataJson(
         uint frameId,
         ulong timestampNs,
@@ -387,6 +531,72 @@ public class QuestCameraCapture : MonoBehaviour
             };
 
             json = JsonUtility.ToJson(metadata);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Camera pose metadata read failed: {ex.Message}";
+            return false;
+        }
+    }
+
+    public bool TryBuildFramePoseMetadata(
+        uint frameId,
+        ulong timestampNs,
+        out QuestCameraFramePoseMetadata metadata,
+        out string error
+    )
+    {
+        metadata = null;
+        error = string.Empty;
+
+        if (_cameraAccess == null)
+        {
+            error = "Camera access component is not initialized.";
+            return false;
+        }
+
+        if (!GetIsPlaying())
+        {
+            error = "Camera is not yet playing.";
+            return false;
+        }
+
+        if (_getCameraPoseMethod == null)
+        {
+            error = "Passthrough camera pose is not exposed by this MRUK/PCA version.";
+            return false;
+        }
+
+        try
+        {
+            object value = _getCameraPoseMethod.Invoke(_cameraAccess, null);
+            if (!(value is Pose pose))
+            {
+                error = "Camera pose returned an unexpected value.";
+                return false;
+            }
+
+            metadata = new QuestCameraFramePoseMetadata
+            {
+                camera_eye = cameraEye == CameraEye.Left ? "left" : "right",
+                frame_id = frameId,
+                timestamp_ns = timestampNs,
+                position_world = new[]
+                {
+                    pose.position.x,
+                    pose.position.y,
+                    pose.position.z,
+                },
+                rotation_world = new[]
+                {
+                    pose.rotation.x,
+                    pose.rotation.y,
+                    pose.rotation.z,
+                    pose.rotation.w,
+                },
+            };
+
             return true;
         }
         catch (Exception ex)

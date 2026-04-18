@@ -3,6 +3,7 @@ using TMPro;
 using UnityEngine.UI;
 using System;
 using System.Net.Sockets;
+using System.IO;
 
 public class AppManager : MonoBehaviour
 {
@@ -34,18 +35,20 @@ public class AppManager : MonoBehaviour
     public bool ShowVideoStream => videoStreamToggle != null && videoStreamToggle.isOn;
 
     public Toggle cameraUplinkToggle;
-    public bool EnableCameraUplink => cameraUplinkToggle != null && cameraUplinkToggle.isOn;
+    public bool EnableCameraUplink => UseLocalSaveMode || (cameraUplinkToggle != null && cameraUplinkToggle.isOn);
 
     public Toggle headPoseToggle;
-    public bool TrackHeadPose => headPoseToggle != null && headPoseToggle.isOn;
+    public bool TrackHeadPose => UseLocalSaveMode || (headPoseToggle != null && headPoseToggle.isOn);
 
     [Header("Camera Uplink Defaults")]
     [SerializeField] private bool includeStreamMetadata = true;
     [SerializeField] private string cameraPreset = "640x480@30";
     [SerializeField] private int cameraBitrateKbps = 2500;
     [SerializeField] private int videoSignalingPort = 8765;
+    [SerializeField] private bool localSaveMode = true;
 
     public bool IncludeStreamMetadata => includeStreamMetadata;
+    public bool UseLocalSaveMode => localSaveMode;
     public string CameraPreset => string.IsNullOrWhiteSpace(cameraPreset) ? "640x480@30" : cameraPreset;
     public int CameraBitrateKbps => Mathf.Max(250, cameraBitrateKbps);
     public int VideoSignalingPort => Mathf.Clamp(videoSignalingPort, 1, 65535);
@@ -185,6 +188,16 @@ public class AppManager : MonoBehaviour
 private void OnProtocolChanged(int index)
     {
         ClearError();
+        if (UseLocalSaveMode)
+        {
+            if (portInputField != null && string.IsNullOrWhiteSpace(portInputField.text))
+            {
+                portInputField.text = "8000";
+            }
+            UpdateStatusUI("Local Save Ready", Color.green, true);
+            return;
+        }
+
         if (index == 0) // UDP
         {
             if (ipInputField != null) ipInputField.text = "255.255.255.255";
@@ -214,6 +227,12 @@ private void OnProtocolChanged(int index)
 
     private void ValidateNetwork()
     {
+        if (UseLocalSaveMode)
+        {
+            UpdateStatusUI("Local Save Ready", Color.green, true);
+            return;
+        }
+
         if (Application.internetReachability == NetworkReachability.NotReachable)
         {
             UpdateStatusUI("Error: No Active Network Connection", Color.red, false);
@@ -255,16 +274,22 @@ private void OnProtocolChanged(int index)
         int parsedPort;
         if (!int.TryParse(portInputField.text, out parsedPort))
         {
-            UpdateStatusUI("Error: Port number is invalid", Color.red, false);
-            return;
+            if (UseLocalSaveMode)
+            {
+                parsedPort = 0;
+            }
+            else
+            {
+                UpdateStatusUI("Error: Port number is invalid", Color.red, false);
+                return;
+            }
         }
         ServerPort = parsedPort;
 
         SelectedProtocol = protocolDropdown.value;
         SelectedHandMode = handDropdown.value;
 
-        // --- UPDATED TCP CHECK BLOCK ---
-        if (SelectedProtocol == 1 || SelectedProtocol == 2) // TCP wireless and wired
+        if (!UseLocalSaveMode && (SelectedProtocol == 1 || SelectedProtocol == 2)) // TCP wireless and wired
         {
             try 
             {
@@ -307,16 +332,17 @@ private void OnProtocolChanged(int index)
                 return; 
             }
         }
-        // -------------------------------
 
-        UpdateStatusUI("Streaming Active", Color.green, true);
+        UpdateStatusUI(UseLocalSaveMode ? "Local Recording Active" : "Streaming Active", Color.green, true);
 
         // Save the current config for next time
         SaveConfig();
         
         string protocolName = protocolDropdown.options[SelectedProtocol].text;
         string handName = handDropdown.options[SelectedHandMode].text;
-        string statusMsg = $"Stream started! \nIP: {ServerIP} \nPort: {ServerPort} \nProtocol: {protocolName} \nHands: {handName}";
+        string statusMsg = UseLocalSaveMode
+            ? $"Local recording started! \nPreset: {CameraPreset} \nHands: {handName} \nOutput: {Path.Combine(Application.persistentDataPath, "recordings")}"
+            : $"Stream started! \nIP: {ServerIP} \nPort: {ServerPort} \nProtocol: {protocolName} \nHands: {handName}";
         SendLog(statusMsg);
         
         if(menuPanel != null) menuPanel.SetActive(false);
@@ -370,7 +396,7 @@ private void OnProtocolChanged(int index)
 
         if (EnableCameraUplink)
         {
-            if (string.Equals(ServerIP, "255.255.255.255", StringComparison.Ordinal))
+            if (!UseLocalSaveMode && string.Equals(ServerIP, "255.255.255.255", StringComparison.Ordinal))
             {
                 HandleDisconnection("Camera uplink requires a concrete host IP. Use TCP wired or wireless.");
                 return;
@@ -387,7 +413,7 @@ private void OnProtocolChanged(int index)
             try
             {
                 ok = await manager.StartVideoSession(
-                    ServerIP,
+                    UseLocalSaveMode ? "local" : ServerIP,
                     VideoSignalingPort,
                     CameraPreset,
                     CameraBitrateKbps,

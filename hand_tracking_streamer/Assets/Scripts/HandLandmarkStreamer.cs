@@ -61,6 +61,8 @@ public class HandLandmarkStreamer : MonoBehaviour
         25  // Pinky Tip
     };
 
+    private QuestLocalDatasetRecorder _localRecorder;
+
     private void Start()
     {
         _hand = GetComponent<IHand>();
@@ -93,8 +95,8 @@ public class HandLandmarkStreamer : MonoBehaviour
         if (mode == 1 && _handSide == HandSide.Right) return;
         if (mode == 2 && _handSide == HandSide.Left) return;
 
-        // 3. Init Network
-        if (!_isInitialized) InitializeNetwork();
+        // 3. Init Network only when the app is actually streaming to a host.
+        if (!AppManager.Instance.UseLocalSaveMode && !_isInitialized) InitializeNetwork();
 
         // 4. Rate Limiting
         _timer += Time.deltaTime;
@@ -114,18 +116,15 @@ public class HandLandmarkStreamer : MonoBehaviour
 
         bool includeMetadata = AppManager.Instance == null || AppManager.Instance.IncludeStreamMetadata;
 
-        uint frameId = 0;
-        ulong sendTimestampNs = 0;
+        uint frameId = QuestStreamClock.NextFrameId(ref _frameId);
+        ulong sendTimestampNs = QuestStreamClock.GetMonotonicTimestampNs();
 
-        if (includeMetadata)
-        {
-            frameId = QuestStreamClock.NextFrameId(ref _frameId);
-            sendTimestampNs = QuestStreamClock.GetMonotonicTimestampNs();
-        }
+        _localRecorder = ResolveLocalRecorder();
 
         // --- 1. PROCESS WRIST ---
         if (_hand.GetRootPose(out Pose rootPose))
         {
+            string wristLabel;
             // Prepare Network Packet
             if (includeMetadata)
             {
@@ -137,15 +136,41 @@ public class HandLandmarkStreamer : MonoBehaviour
                     sendTimestampNs
                 );
                 _sbPacket.Append(", ");
+                wristLabel = QuestStreamClock.BuildLabelWithMeta(
+                    _handSide.ToString(),
+                    "wrist",
+                    frameId,
+                    sendTimestampNs);
             }
             else
             {
                 _sbPacket.Append(_handSide).Append(" wrist:, ");
+                wristLabel = $"{_handSide} wrist";
             }
 
             AppendVector3(_sbPacket, rootPose.position);
             _sbPacket.Append(", ");
             AppendQuaternion(_sbPacket, rootPose.rotation);
+
+            if (_localRecorder != null && _localRecorder.IsRecording)
+            {
+                _localRecorder.RecordTelemetry(
+                    _handSide == HandSide.Left ? "left" : "right",
+                    "wrist",
+                    unchecked((int)frameId),
+                    unchecked((long)sendTimestampNs),
+                    wristLabel,
+                    new[]
+                    {
+                        rootPose.position.x,
+                        rootPose.position.y,
+                        rootPose.position.z,
+                        rootPose.rotation.x,
+                        rootPose.rotation.y,
+                        rootPose.rotation.z,
+                        rootPose.rotation.w,
+                    });
+            }
 
             // Prepare HUD Log
             if (_logToHUD)
@@ -159,6 +184,7 @@ public class HandLandmarkStreamer : MonoBehaviour
         // --- 2. PROCESS LANDMARKS ---
         if (_hand.GetJointPosesFromWrist(out ReadOnlyHandJointPoses joints))
         {
+            string landmarkLabel;
             // Network Packet
             _sbPacket.Append("\n");
             if (includeMetadata)
@@ -170,23 +196,47 @@ public class HandLandmarkStreamer : MonoBehaviour
                     frameId,
                     sendTimestampNs
                 );
+                landmarkLabel = QuestStreamClock.BuildLabelWithMeta(
+                    _handSide.ToString(),
+                    "landmarks",
+                    frameId,
+                    sendTimestampNs);
             }
             else
             {
                 _sbPacket.Append(_handSide).Append(" landmarks:");
+                landmarkLabel = $"{_handSide} landmarks";
             }
-            
+            float[] landmarkValues = new float[_streamedJoints.Length * 3];
+            int landmarkOffset = 0;
             foreach (int index in _streamedJoints)
             {
                 if (index < joints.Count)
                 {
                     _sbPacket.Append(", ");
                     AppendVector3(_sbPacket, joints[index].position);
+                    landmarkValues[landmarkOffset++] = joints[index].position.x;
+                    landmarkValues[landmarkOffset++] = joints[index].position.y;
+                    landmarkValues[landmarkOffset++] = joints[index].position.z;
                 }
                 else
                 {
                     _sbPacket.Append(", 0, 0, 0");
+                    landmarkValues[landmarkOffset++] = 0f;
+                    landmarkValues[landmarkOffset++] = 0f;
+                    landmarkValues[landmarkOffset++] = 0f;
                 }
+            }
+
+            if (_localRecorder != null && _localRecorder.IsRecording)
+            {
+                _localRecorder.RecordTelemetry(
+                    _handSide == HandSide.Left ? "left" : "right",
+                    "landmarks",
+                    unchecked((int)frameId),
+                    unchecked((long)sendTimestampNs),
+                    landmarkLabel,
+                    landmarkValues);
             }
 
             // HUD Log
@@ -209,7 +259,10 @@ public class HandLandmarkStreamer : MonoBehaviour
         }
 
         // --- 3. SEND NETWORK DATA ---
-        SendData(_sbPacket.ToString());
+        if (AppManager.Instance != null && !AppManager.Instance.UseLocalSaveMode)
+        {
+            SendData(_sbPacket.ToString());
+        }
     }
 
     // --- NETWORK HELPERS ---
@@ -337,5 +390,11 @@ public class HandLandmarkStreamer : MonoBehaviour
         {
             LogManager.Instance.Log(_hudLogSource, msg);
         }
+    }
+
+    private QuestLocalDatasetRecorder ResolveLocalRecorder()
+    {
+        QuestCameraUplinkManager manager = FindFirstObjectByType<QuestCameraUplinkManager>();
+        return manager != null ? manager.DatasetRecorder : null;
     }
 }
