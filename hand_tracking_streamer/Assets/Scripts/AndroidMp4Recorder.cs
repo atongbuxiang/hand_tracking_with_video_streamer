@@ -47,7 +47,7 @@ public class AndroidMp4Recorder : IDisposable
 #endif
     }
 
-    public bool AddFrame(Color32[] pixels, long timestampNs, out string error)
+    public bool AddFrame(byte[] rgb24Bytes, long timestampNs, out string error)
     {
         error = string.Empty;
         if (!_started || _encoder == null)
@@ -56,27 +56,17 @@ public class AndroidMp4Recorder : IDisposable
             return false;
         }
 
-        if (pixels == null || pixels.Length != _width * _height)
+        int expectedBytes = _width * _height * 3;
+        if (rgb24Bytes == null || rgb24Bytes.Length != expectedBytes)
         {
-            error = $"Unexpected pixel buffer size. Expected {_width * _height}, got {pixels?.Length ?? 0}.";
+            error = $"Unexpected RGB buffer size. Expected {expectedBytes}, got {rgb24Bytes?.Length ?? 0}.";
             return false;
         }
 
 #if UNITY_ANDROID && !UNITY_EDITOR
         try
         {
-            byte[] rgba = new byte[pixels.Length * 4];
-            for (int i = 0; i < pixels.Length; i++)
-            {
-                int offset = i * 4;
-                Color32 pixel = pixels[i];
-                rgba[offset + 0] = pixel.r;
-                rgba[offset + 1] = pixel.g;
-                rgba[offset + 2] = pixel.b;
-                rgba[offset + 3] = pixel.a;
-            }
-
-            _encoder.Call("encodeRgbaFrame", rgba, timestampNs);
+            _encoder.Call("encodeRgb24Frame", rgb24Bytes, timestampNs);
             return true;
         }
         catch (Exception ex)

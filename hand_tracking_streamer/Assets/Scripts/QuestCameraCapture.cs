@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using Unity.Collections;
 using UnityEngine;
 
 [Serializable]
@@ -68,6 +69,7 @@ public class QuestCameraCapture : MonoBehaviour
     private bool _hasLoggedMissingDependency;
     private Texture2D _cpuReadbackTexture;
     private RenderTexture _cpuReadbackTarget;
+    private byte[] _cpuReadbackRgbBytes;
     private uint _encodedFrameId;
 
     public event Action<Texture, ulong> OnFrameAvailable;
@@ -236,7 +238,6 @@ public class QuestCameraCapture : MonoBehaviour
             RenderTexture previous = RenderTexture.active;
             RenderTexture.active = _cpuReadbackTarget;
             _cpuReadbackTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
-            _cpuReadbackTexture.Apply(false, false);
             RenderTexture.active = previous;
 
             jpegBytes = _cpuReadbackTexture.EncodeToJPG(Mathf.Clamp(jpegQuality, 1, 100));
@@ -309,7 +310,6 @@ public class QuestCameraCapture : MonoBehaviour
             RenderTexture previous = RenderTexture.active;
             RenderTexture.active = _cpuReadbackTarget;
             _cpuReadbackTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
-            _cpuReadbackTexture.Apply(false, false);
             RenderTexture.active = previous;
 
             pixels = _cpuReadbackTexture.GetPixels32();
@@ -326,6 +326,82 @@ public class QuestCameraCapture : MonoBehaviour
         catch (Exception ex)
         {
             error = $"RGBA frame capture failed: {ex.Message}";
+            return false;
+        }
+    }
+
+    public bool TryReadRgbFrame(
+        out byte[] rgbBytes,
+        out uint frameId,
+        out ulong timestampNs,
+        out int width,
+        out int height,
+        out string error
+    )
+    {
+        rgbBytes = null;
+        frameId = 0;
+        timestampNs = 0;
+        width = 0;
+        height = 0;
+        error = string.Empty;
+
+        if (_cameraAccess == null)
+        {
+            error = "Camera access component is not initialized.";
+            return false;
+        }
+
+        if (!GetIsPlaying())
+        {
+            error = "Camera is not yet playing.";
+            return false;
+        }
+
+        Texture sourceTexture = GetLatestTexture();
+        if (sourceTexture == null)
+        {
+            error = "Camera texture is unavailable.";
+            return false;
+        }
+
+        width = sourceTexture.width;
+        height = sourceTexture.height;
+        if (width <= 0 || height <= 0)
+        {
+            error = $"Camera texture has invalid dimensions {width}x{height}.";
+            return false;
+        }
+
+        try
+        {
+            EnsureCpuReadbackTargets(width, height);
+            EnsureCpuReadbackRgbBuffer(width * height * 3);
+
+            Graphics.Blit(sourceTexture, _cpuReadbackTarget);
+
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture.active = _cpuReadbackTarget;
+            _cpuReadbackTexture.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+            RenderTexture.active = previous;
+
+            NativeArray<byte> raw = _cpuReadbackTexture.GetRawTextureData<byte>();
+            if (!raw.IsCreated || raw.Length == 0)
+            {
+                error = "RGB readback returned an empty buffer.";
+                return false;
+            }
+
+            raw.CopyTo(_cpuReadbackRgbBytes);
+            rgbBytes = _cpuReadbackRgbBytes;
+
+            frameId = QuestStreamClock.NextFrameId(ref _encodedFrameId);
+            timestampNs = QuestStreamClock.GetMonotonicTimestampNs();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"RGB frame capture failed: {ex.Message}";
             return false;
         }
     }
@@ -763,6 +839,14 @@ public class QuestCameraCapture : MonoBehaviour
         }
     }
 
+    private void EnsureCpuReadbackRgbBuffer(int requiredBytes)
+    {
+        if (_cpuReadbackRgbBytes == null || _cpuReadbackRgbBytes.Length != requiredBytes)
+        {
+            _cpuReadbackRgbBytes = new byte[requiredBytes];
+        }
+    }
+
     private void OnDestroy()
     {
         if (_cpuReadbackTexture != null)
@@ -770,6 +854,8 @@ public class QuestCameraCapture : MonoBehaviour
             Destroy(_cpuReadbackTexture);
             _cpuReadbackTexture = null;
         }
+
+        _cpuReadbackRgbBytes = null;
 
         if (_cpuReadbackTarget != null)
         {

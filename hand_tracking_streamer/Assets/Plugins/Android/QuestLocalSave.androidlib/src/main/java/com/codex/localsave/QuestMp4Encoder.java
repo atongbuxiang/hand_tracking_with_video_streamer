@@ -7,6 +7,9 @@ import android.media.MediaMuxer;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public final class QuestMp4Encoder {
     private static final String MIME_TYPE = "video/avc";
@@ -21,6 +24,20 @@ public final class QuestMp4Encoder {
     private boolean muxerStarted = false;
     private int width;
     private int height;
+    private byte[] nv12Buffer;
+    private BlockingQueue<FrameData> frameQueue;
+    private Thread workerThread;
+    private volatile boolean acceptingFrames;
+
+    private static final class FrameData {
+        final byte[] rgb24;
+        final long presentationTimeNs;
+
+        FrameData(byte[] rgb24, long presentationTimeNs) {
+            this.rgb24 = rgb24;
+            this.presentationTimeNs = presentationTimeNs;
+        }
+    }
 
     public static QuestMp4Encoder create() {
         return new QuestMp4Encoder();
@@ -31,6 +48,7 @@ public final class QuestMp4Encoder {
 
         this.width = width;
         this.height = height;
+        this.nv12Buffer = new byte[(width * height * 3) / 2];
         bufferInfo = new MediaCodec.BufferInfo();
 
         MediaFormat format = MediaFormat.createVideoFormat(MIME_TYPE, width, height);
@@ -46,30 +64,37 @@ public final class QuestMp4Encoder {
         muxer = new MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
         trackIndex = -1;
         muxerStarted = false;
+        frameQueue = new ArrayBlockingQueue<>(2);
+        acceptingFrames = true;
+        workerThread = new Thread(this::workerLoop, "QuestMp4EncoderWorker");
+        workerThread.start();
     }
 
-    public void encodeRgbaFrame(byte[] rgba, long presentationTimeNs) {
-        if (codec == null) {
+    public void encodeRgb24Frame(byte[] rgb24, long presentationTimeNs) {
+        if (codec == null || !acceptingFrames || frameQueue == null) {
             throw new IllegalStateException("Encoder is not started.");
         }
 
-        byte[] yuv = rgbaToNv12(rgba, width, height);
-        int inputIndex = codec.dequeueInputBuffer(TIMEOUT_US);
-        if (inputIndex >= 0) {
-            ByteBuffer inputBuffer = codec.getInputBuffer(inputIndex);
-            if (inputBuffer != null) {
-                inputBuffer.clear();
-                inputBuffer.put(yuv);
-                codec.queueInputBuffer(inputIndex, 0, yuv.length, presentationTimeNs / 1000L, 0);
-            }
-        }
+        FrameData frame = new FrameData(rgb24, presentationTimeNs);
 
-        drain(false);
+        if (!frameQueue.offer(frame)) {
+            frameQueue.poll();
+            frameQueue.offer(frame);
+        }
     }
 
     public void stop() {
         if (codec == null && muxer == null) {
             return;
+        }
+
+        acceptingFrames = false;
+        if (workerThread != null) {
+            try {
+                workerThread.join(5000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
         }
 
         try {
@@ -114,6 +139,39 @@ public final class QuestMp4Encoder {
         muxer = null;
         muxerStarted = false;
         trackIndex = -1;
+        nv12Buffer = null;
+        frameQueue = null;
+        workerThread = null;
+    }
+
+    private void workerLoop() {
+        while (acceptingFrames || (frameQueue != null && !frameQueue.isEmpty())) {
+            FrameData frame = null;
+            try {
+                if (frameQueue != null) {
+                    frame = frameQueue.poll(10, TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+
+            if (frame == null) {
+                continue;
+            }
+
+            byte[] yuv = rgb24ToNv12(frame.rgb24, width, height, nv12Buffer);
+            int inputIndex = codec != null ? codec.dequeueInputBuffer(TIMEOUT_US) : -1;
+            if (inputIndex >= 0) {
+                ByteBuffer inputBuffer = codec.getInputBuffer(inputIndex);
+                if (inputBuffer != null) {
+                    inputBuffer.clear();
+                    inputBuffer.put(yuv);
+                    codec.queueInputBuffer(inputIndex, 0, yuv.length, frame.presentationTimeNs / 1000L, 0);
+                }
+            }
+
+            drain(false);
+        }
     }
 
     private void drain(boolean endOfStream) {
@@ -146,18 +204,21 @@ public final class QuestMp4Encoder {
         }
     }
 
-    private static byte[] rgbaToNv12(byte[] rgba, int width, int height) {
+    private static byte[] rgb24ToNv12(byte[] rgb24, int width, int height, byte[] nv12) {
         int frameSize = width * height;
-        byte[] nv12 = new byte[frameSize + frameSize / 2];
+        if (nv12 == null || nv12.length != frameSize + frameSize / 2) {
+            nv12 = new byte[frameSize + frameSize / 2];
+        }
         int yIndex = 0;
         int uvIndex = frameSize;
 
         for (int j = 0; j < height; j++) {
+            int srcRow = height - 1 - j;
             for (int i = 0; i < width; i++) {
-                int rgbaIndex = (j * width + i) * 4;
-                int r = rgba[rgbaIndex] & 0xFF;
-                int g = rgba[rgbaIndex + 1] & 0xFF;
-                int b = rgba[rgbaIndex + 2] & 0xFF;
+                int rgbIndex = (srcRow * width + i) * 3;
+                int r = rgb24[rgbIndex] & 0xFF;
+                int g = rgb24[rgbIndex + 1] & 0xFF;
+                int b = rgb24[rgbIndex + 2] & 0xFF;
 
                 int y = clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
                 int u = clamp(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);

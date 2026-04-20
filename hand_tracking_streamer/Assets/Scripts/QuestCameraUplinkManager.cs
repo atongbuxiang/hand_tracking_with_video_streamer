@@ -4,6 +4,8 @@ using UnityEngine;
 
 public class QuestCameraUplinkManager : MonoBehaviour
 {
+    private const int MaxLocalSaveFps = 15;
+
     public enum SessionState
     {
         Idle,
@@ -71,7 +73,7 @@ public class QuestCameraUplinkManager : MonoBehaviour
         if (AppManager.Instance != null)
         {
             cameraCapture.SetRequestedResolution(AppManager.Instance.RequestedCameraResolution);
-            maxFps = Mathf.Clamp(AppManager.Instance.RequestedCameraFps, 1, 30);
+            maxFps = Mathf.Clamp(AppManager.Instance.RequestedCameraFps, 1, MaxLocalSaveFps);
         }
 
         _sendIntervalSeconds = 1f / Mathf.Max(1, maxFps);
@@ -156,8 +158,9 @@ public class QuestCameraUplinkManager : MonoBehaviour
 
         if (_datasetRecorder != null)
         {
+            _datasetRecorder.FinalizeAlignedFrames();
             _datasetRecorder.EndRecording();
-            LogInfo($"local save finalized zip={_datasetRecorder.ZipPath}");
+            LogInfo($"local save finalized dir={_datasetRecorder.DatasetDirectory}");
         }
 
         statsOverlay?.SetSignalingState("idle");
@@ -181,8 +184,8 @@ public class QuestCameraUplinkManager : MonoBehaviour
         }
         _sendTimer = 0f;
 
-        if (!cameraCapture.TryReadRgbaFrame(
-                out Color32[] pixels,
+        if (!cameraCapture.TryReadRgbFrame(
+                out byte[] rgbBytes,
                 out uint frameId,
                 out ulong timestampNs,
                 out int width,
@@ -202,7 +205,7 @@ public class QuestCameraUplinkManager : MonoBehaviour
             LogDebug($"camera pose unavailable: {poseError}");
         }
 
-        if (!_videoRecorder.AddFrame(pixels, unchecked((long)timestampNs), out string encodeError))
+        if (!_videoRecorder.AddFrame(rgbBytes, unchecked((long)timestampNs), out string encodeError))
         {
             FailFatal(encodeError);
             return;

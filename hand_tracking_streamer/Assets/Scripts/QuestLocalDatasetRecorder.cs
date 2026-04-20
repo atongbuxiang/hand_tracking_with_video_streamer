@@ -1,9 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.IO.Compression;
 using System.Text;
+using System.Threading;
 using UnityEngine;
 
 [Serializable]
@@ -54,7 +55,6 @@ public class SerializableProjectionDefaults
 public class SerializableStoragePaths
 {
     public string dataset_dir;
-    public string zip_path;
 }
 
 [Serializable]
@@ -136,6 +136,14 @@ public class QuestTelemetrySample
 
 public class QuestLocalDatasetRecorder : MonoBehaviour
 {
+    private sealed class WriteRequest
+    {
+        public StreamWriter Writer;
+        public string Line;
+        public bool FlushAll;
+        public ManualResetEventSlim Completion;
+    }
+
     private const string CameraEye = "left";
     private const float DefaultFovXDeg = 90f;
     private const float DefaultFovYDeg = 70f;
@@ -143,16 +151,15 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
     private const float DefaultCameraYawDeg = 0f;
     private const float DefaultCameraRollDeg = 0f;
     private const int MaxBufferedSamples = 512;
+    private const int FlushLineThreshold = 64;
 
     private readonly Dictionary<string, TimedSampleBuffer> _buffers = new Dictionary<string, TimedSampleBuffer>();
     private readonly Dictionary<int, QuestCameraFramePoseMetadata> _pendingCameraPoseByFrameId =
         new Dictionary<int, QuestCameraFramePoseMetadata>();
-    private readonly object _ioLock = new object();
     private readonly Queue<int> _pendingCameraPoseOrder = new Queue<int>();
 
     private string _datasetName;
     private string _datasetDirectory;
-    private string _zipPath;
     private long _sessionStartedUnixNs;
     private bool _isRecording;
     private int _cameraFrameIndex;
@@ -167,10 +174,12 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
     private AndroidMp4Recorder _videoRecorder;
     private string _videoFileName = "camera.mp4";
     private int _targetFps = 15;
+    private readonly List<QuestCameraFrameRow> _cameraFrameRows = new List<QuestCameraFrameRow>();
+    private BlockingCollection<WriteRequest> _writeQueue;
+    private Thread _writerThread;
 
     public bool IsRecording => _isRecording;
     public string DatasetDirectory => _datasetDirectory;
-    public string ZipPath => _zipPath;
     public string VideoOutputPath => string.IsNullOrWhiteSpace(_datasetDirectory) ? null : Path.Combine(_datasetDirectory, _videoFileName);
 
     private void Awake()
@@ -207,12 +216,12 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
         _projectionSource = "approximate_defaults_in_code";
         _pendingCameraPoseByFrameId.Clear();
         _pendingCameraPoseOrder.Clear();
+        _cameraFrameRows.Clear();
         ClearBuffers();
 
         string recordingsRoot = Path.Combine(Application.persistentDataPath, "recordings");
         string stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
         _datasetDirectory = Path.Combine(recordingsRoot, $"{stamp}_{_datasetName}");
-        _zipPath = _datasetDirectory + ".zip";
 
         try
         {
@@ -220,12 +229,14 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
             _telemetryWriter = CreateWriter("telemetry_raw.jsonl");
             _cameraFramesWriter = CreateWriter("camera_frames.jsonl");
             _alignedFramesWriter = CreateWriter("aligned_frames.jsonl");
+            StartWriterThread();
             _isRecording = true;
             return true;
         }
         catch (Exception ex)
         {
             error = $"Failed to initialize dataset writers: {ex.Message}";
+            StopWriterThread();
             SafeDisposeWriters();
             _isRecording = false;
             return false;
@@ -243,8 +254,9 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
         try
         {
             WriteSessionJson();
+            FlushAllWriters();
+            StopWriterThread();
             SafeDisposeWriters();
-            BuildZipArchive();
         }
         catch (Exception ex)
         {
@@ -342,11 +354,38 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
             width = width,
             height = height,
         };
+        _cameraFrameRows.Add(frameRow);
         WriteJsonLine(_cameraFramesWriter, frameRow);
 
-        QuestAlignedFrameRow aligned = BuildAlignedRow(frameId, timestampNs, width, height, receivedAtNs, _cameraFrameIndex);
-        WriteJsonLine(_alignedFramesWriter, aligned);
         _cameraFrameIndex++;
+    }
+
+    public void FinalizeAlignedFrames()
+    {
+        if (!_isRecording || string.IsNullOrWhiteSpace(_datasetDirectory))
+        {
+            return;
+        }
+
+        if (_alignedFramesWriter == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < _cameraFrameRows.Count; i++)
+        {
+            QuestCameraFrameRow frameRow = _cameraFrameRows[i];
+            QuestAlignedFrameRow aligned = BuildAlignedRow(
+                frameRow.camera_frame_id,
+                frameRow.camera_timestamp_ns,
+                frameRow.width,
+                frameRow.height,
+                frameRow.camera_received_at_ns,
+                frameRow.camera_frame_index);
+            WriteJsonLine(_alignedFramesWriter, aligned);
+        }
+
+        FlushAllWriters();
     }
 
     private QuestAlignedFrameRow BuildAlignedRow(int frameId, long timestampNs, int width, int height, long receivedAtNs, int frameIndex)
@@ -486,7 +525,7 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
     private StreamWriter CreateWriter(string fileName)
     {
         string path = Path.Combine(_datasetDirectory, fileName);
-        return new StreamWriter(path, false, new UTF8Encoding(false));
+        return new StreamWriter(path, false, new UTF8Encoding(false), 64 * 1024);
     }
 
     private void WriteJsonLine<T>(StreamWriter writer, T value)
@@ -496,10 +535,135 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
             return;
         }
 
-        lock (_ioLock)
+        string line = JsonUtility.ToJson(value);
+        if (_writeQueue == null)
         {
-            writer.WriteLine(JsonUtility.ToJson(value));
+            writer.WriteLine(line);
             writer.Flush();
+            return;
+        }
+
+        try
+        {
+            _writeQueue.Add(new WriteRequest
+            {
+                Writer = writer,
+                Line = line,
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            writer.WriteLine(line);
+            writer.Flush();
+        }
+    }
+
+    private void FlushAllWriters()
+    {
+        if (_writeQueue == null)
+        {
+            FlushAllWritersDirect();
+            return;
+        }
+
+        using (ManualResetEventSlim completion = new ManualResetEventSlim(false))
+        {
+            try
+            {
+                _writeQueue.Add(new WriteRequest
+                {
+                    FlushAll = true,
+                    Completion = completion,
+                });
+                completion.Wait();
+            }
+            catch (InvalidOperationException)
+            {
+                FlushAllWritersDirect();
+            }
+        }
+    }
+
+    private void FlushAllWritersDirect()
+    {
+        _telemetryWriter?.Flush();
+        _cameraFramesWriter?.Flush();
+        _alignedFramesWriter?.Flush();
+    }
+
+    private void StartWriterThread()
+    {
+        _writeQueue = new BlockingCollection<WriteRequest>(new ConcurrentQueue<WriteRequest>());
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name = "QuestLocalDatasetWriter",
+        };
+        _writerThread.Start();
+    }
+
+    private void StopWriterThread()
+    {
+        if (_writeQueue == null)
+        {
+            return;
+        }
+
+        try
+        {
+            _writeQueue.CompleteAdding();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        if (_writerThread != null && _writerThread.IsAlive)
+        {
+            _writerThread.Join(5000);
+        }
+
+        _writeQueue.Dispose();
+        _writeQueue = null;
+        _writerThread = null;
+    }
+
+    private void WriterLoop()
+    {
+        int pendingLines = 0;
+
+        try
+        {
+            foreach (WriteRequest request in _writeQueue.GetConsumingEnumerable())
+            {
+                if (request == null)
+                {
+                    continue;
+                }
+
+                if (request.FlushAll)
+                {
+                    FlushAllWritersDirect();
+                    pendingLines = 0;
+                    request.Completion?.Set();
+                    continue;
+                }
+
+                if (request.Writer != null && request.Line != null)
+                {
+                    request.Writer.WriteLine(request.Line);
+                    pendingLines++;
+                    if (pendingLines >= FlushLineThreshold)
+                    {
+                        FlushAllWritersDirect();
+                        pendingLines = 0;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            FlushAllWritersDirect();
         }
     }
 
@@ -545,31 +709,11 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
             storage = new SerializableStoragePaths
             {
                 dataset_dir = _datasetDirectory,
-                zip_path = _zipPath,
             },
         };
 
         string sessionJson = JsonUtility.ToJson(session, true);
         File.WriteAllText(Path.Combine(_datasetDirectory, "session.json"), sessionJson, new UTF8Encoding(false));
-    }
-
-    private void BuildZipArchive()
-    {
-        if (string.IsNullOrWhiteSpace(_datasetDirectory) || !Directory.Exists(_datasetDirectory))
-        {
-            return;
-        }
-
-        if (File.Exists(_zipPath))
-        {
-            File.Delete(_zipPath);
-        }
-
-        ZipFile.CreateFromDirectory(
-            _datasetDirectory,
-            _zipPath,
-            System.IO.Compression.CompressionLevel.Optimal,
-            false);
     }
 
     private SerializableProjectionDefaults BuildFallbackProjectionDefaults()
@@ -626,6 +770,7 @@ public class QuestLocalDatasetRecorder : MonoBehaviour
 
     private void SafeDisposeWriters()
     {
+        FlushAllWritersDirect();
         _telemetryWriter?.Dispose();
         _cameraFramesWriter?.Dispose();
         _alignedFramesWriter?.Dispose();
