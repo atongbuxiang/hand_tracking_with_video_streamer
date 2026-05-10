@@ -2,6 +2,8 @@
 
 Usage:
     python ./scripts/reproject_quest_dataset.py --name demo
+    python ./scripts/reproject_quest_dataset.py --name demo --session session_001
+    python ./scripts/reproject_quest_dataset.py --name demo --segment 3
     python ./scripts/reproject_quest_dataset.py --name demo --output-root ./data --fps 15
 """
 
@@ -23,6 +25,7 @@ from hts_dataset_utils import (
     default_camera_offset,
     finger_segment_indices,
     project_world_to_image_with_calibration,
+    resolve_replay_dir,
 )
 
 
@@ -131,12 +134,37 @@ def _load_session(dataset_dir: Path) -> dict:
     return json.loads(session_path.read_text(encoding="utf-8"))
 
 
+def _load_segment(dataset_dir: Path, segment_index: int) -> dict:
+    segments_path = dataset_dir / "segments.json"
+    if not segments_path.exists():
+        raise SystemExit(f"segments.json not found in {dataset_dir}")
+
+    segments_data = json.loads(segments_path.read_text(encoding="utf-8"))
+    for segment in segments_data.get("segments", []):
+        if int(segment.get("segment_index", -1)) == segment_index:
+            return segment
+
+    available = ", ".join(str(segment.get("segment_index")) for segment in segments_data.get("segments", []))
+    raise SystemExit(f"Segment {segment_index} not found in {segments_path}. Available segments: {available}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reproject_quest_dataset",
         description="Replay a recorded Quest dataset and project hands back into the image.",
     )
     parser.add_argument("--name", required=True, help="Dataset name under ./data.")
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Optional session name. When omitted, the script auto-detects a single session directory.",
+    )
+    parser.add_argument(
+        "--segment",
+        type=int,
+        default=None,
+        help="Optional segment_index from segments.json to replay.",
+    )
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="Dataset root.")
     parser.add_argument("--fps", type=float, default=DEFAULT_DATASET_FPS, help="Dataset playback fps.")
     return parser
@@ -146,12 +174,27 @@ def main() -> None:
     args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    dataset_dir = Path(args.output_root) / args.name
+    dataset_dir = resolve_replay_dir(args.output_root, args.name, args.session)
 
     session = _load_session(dataset_dir)
     aligned_rows = pq.read_table(dataset_dir / "aligned_frames.parquet").to_pylist()
     video_path = dataset_dir / session.get("video_path", "camera.mp4")
     reader = imageio.get_reader(video_path)
+    segment = _load_segment(dataset_dir, args.segment) if args.segment is not None else None
+    start_frame_index = 0
+    end_frame_index = len(aligned_rows) - 1
+    if segment is not None:
+        start_frame_index = int(segment["start_frame_index"])
+        end_frame_index = int(segment["end_frame_index"])
+        if start_frame_index < 0 or end_frame_index < start_frame_index:
+            raise SystemExit(f"Invalid frame range in segment {args.segment}: {start_frame_index}..{end_frame_index}")
+        end_frame_index = min(end_frame_index, len(aligned_rows) - 1)
+        logging.info(
+            "Replaying segment %d frames %d..%d",
+            args.segment,
+            start_frame_index,
+            end_frame_index,
+        )
 
     import matplotlib.pyplot as plt
 
@@ -164,6 +207,10 @@ def main() -> None:
     try:
         for index, frame in enumerate(reader):
             if index >= len(aligned_rows):
+                break
+            if index < start_frame_index:
+                continue
+            if index > end_frame_index:
                 break
 
             row = aligned_rows[index]
@@ -216,7 +263,10 @@ def main() -> None:
                 image_artist = axis.imshow(pil_image)
             else:
                 image_artist.set_data(pil_image)
-            axis.set_title(f"Quest Dataset Replay - frame {index}")
+            title = f"Quest Dataset Replay - frame {index}"
+            if segment is not None:
+                title = f"Quest Dataset Replay - segment {args.segment} frame {index}"
+            axis.set_title(title)
             display.canvas.draw_idle()
             display.canvas.flush_events()
             plt.pause(pause_seconds)

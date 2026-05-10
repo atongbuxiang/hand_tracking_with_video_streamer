@@ -41,12 +41,14 @@ adb reverse tcp:8765 tcp:8765
 
 ```bash
 python ./scripts/record_quest_dataset.py --name your_dataset_name --output-root ./data --fps 30
+python ./scripts/record_quest_dataset.py --name your_dataset_name --segments --output-root ./data --fps 30
 ```
 
 5. vissualize dataset:
 
 ```bash
 python ./scripts/reproject_quest_dataset.py --name your_dataset_name
+python ./scripts/reproject_quest_dataset.py --name your_dataset_name --segment 3
 ```
 
 

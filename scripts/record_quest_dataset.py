@@ -1,4 +1,4 @@
-"""Record Quest camera, hand, and head streams into ./data/{name}.
+"""Record Quest camera, hand, and head streams into ./data/{name} or ./data/{name}/{session}.
 
 The script:
     - listens for HTS hand/head TCP telemetry
@@ -8,6 +8,8 @@ The script:
 
 Usage:
     python ./scripts/record_quest_dataset.py --name demo
+    python ./scripts/record_quest_dataset.py --name demo --session session_001
+    python ./scripts/record_quest_dataset.py --name demo --segments
     python ./scripts/record_quest_dataset.py --name demo --output-root ./data --fps 15
 """
 
@@ -41,6 +43,7 @@ from hts_dataset_utils import (
     intrinsics_from_fov,
     landmarks_local_to_world,
     parse_hts_line,
+    resolve_recording_dir,
 )
 
 
@@ -80,6 +83,26 @@ class CameraFrame:
     height: int
     jpeg_bytes: bytes
     received_at_ns: int
+
+
+@dataclass
+class SegmentState:
+    segment_index: int
+    label: str
+    start_frame_index: int
+    start_timestamp_ns: int
+    end_frame_index: int | None = None
+    end_timestamp_ns: int | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "segment_index": self.segment_index,
+            "label": self.label,
+            "start_frame_index": self.start_frame_index,
+            "end_frame_index": self.end_frame_index,
+            "start_timestamp_ns": self.start_timestamp_ns,
+            "end_timestamp_ns": self.end_timestamp_ns,
+        }
 
 
 class TimedSampleBuffer:
@@ -337,6 +360,13 @@ class DatasetRecorder:
         self._telemetry_lock = threading.Lock()
         self._camera_metadata: dict | None = None
         self._pending_camera_pose_by_frame_id: dict[int, dict] = {}
+        self._segments_enabled = bool(args.segments)
+        self._segment_key = "n"
+        self._segment_lock = threading.Lock()
+        self._segments: list[SegmentState] = []
+        self._current_segment: SegmentState | None = None
+        self._last_camera_frame_index: int | None = None
+        self._last_camera_timestamp_ns: int | None = None
 
     def on_telemetry_sample(self, stream: str, kind: str, sample: TelemetrySample, raw_label: str) -> None:
         key = (stream, kind)
@@ -364,9 +394,11 @@ class DatasetRecorder:
             self._latest_preview_rgb = rgb
 
         self._frame_counter += 1
+        camera_frame_index = len(self.camera_rows)
+        self._maybe_start_segment(camera_frame_index, frame.timestamp_ns)
         self.camera_rows.append(
             {
-                "camera_frame_index": len(self.camera_rows),
+                "camera_frame_index": camera_frame_index,
                 "camera_frame_id": frame.frame_id,
                 "camera_timestamp_ns": frame.timestamp_ns,
                 "camera_received_at_ns": frame.received_at_ns,
@@ -375,6 +407,7 @@ class DatasetRecorder:
             }
         )
         self.aligned_rows.append(self._build_aligned_row(frame))
+        self._remember_latest_frame(camera_frame_index, frame.timestamp_ns)
 
         elapsed = max(time.monotonic() - self._fps_started_at, 1e-6)
         if self._frame_counter % max(int(self.args.fps), 1) == 0:
@@ -411,10 +444,25 @@ class DatasetRecorder:
                 return None
             return self._latest_preview_rgb.copy()
 
+    def advance_segment(self) -> None:
+        if not self._segments_enabled:
+            return
+        with self._segment_lock:
+            if self._last_camera_frame_index is None or self._last_camera_timestamp_ns is None:
+                logging.info("No camera frame received yet; segment switch ignored.")
+                return
+
+            self._finish_current_segment_locked(
+                self._last_camera_frame_index,
+                self._last_camera_timestamp_ns,
+            )
+            logging.info("The next received frame will start segment %d", len(self._segments) + 1)
+
     def close(self) -> None:
         if self._writer is not None:
             self._writer.close()
             self._writer = None
+        self._finalize_segments()
         self._write_outputs()
 
     def _ensure_writer(self, width: int, height: int) -> None:
@@ -489,6 +537,52 @@ class DatasetRecorder:
 
         return row
 
+    def _maybe_start_segment(self, frame_index: int, timestamp_ns: int) -> None:
+        if not self._segments_enabled:
+            return
+        with self._segment_lock:
+            if self._current_segment is not None:
+                return
+            next_index = len(self._segments) + 1
+            self._current_segment = SegmentState(
+                segment_index=next_index,
+                label=f"seg{next_index}",
+                start_frame_index=frame_index,
+                start_timestamp_ns=timestamp_ns,
+            )
+            logging.info("Started segment %d at frame %d", next_index, frame_index)
+
+    def _remember_latest_frame(self, frame_index: int, timestamp_ns: int) -> None:
+        if not self._segments_enabled:
+            return
+        with self._segment_lock:
+            self._last_camera_frame_index = frame_index
+            self._last_camera_timestamp_ns = timestamp_ns
+
+    def _finish_current_segment_locked(self, end_frame_index: int, end_timestamp_ns: int) -> None:
+        if self._current_segment is None:
+            return
+        self._current_segment.end_frame_index = end_frame_index
+        self._current_segment.end_timestamp_ns = end_timestamp_ns
+        self._segments.append(self._current_segment)
+        logging.info(
+            "Finished segment %d at frame %d",
+            self._current_segment.segment_index,
+            end_frame_index,
+        )
+        self._current_segment = None
+
+    def _finalize_segments(self) -> None:
+        if not self._segments_enabled:
+            return
+        with self._segment_lock:
+            if self._last_camera_frame_index is None or self._last_camera_timestamp_ns is None:
+                return
+            self._finish_current_segment_locked(
+                self._last_camera_frame_index,
+                self._last_camera_timestamp_ns,
+            )
+
     @staticmethod
     def _append_pose(
         row: dict,
@@ -559,8 +653,10 @@ class DatasetRecorder:
 
         session = {
             "dataset_name": self.args.name,
+            "session_name": self.args.session,
             "created_at_unix_ns": self._session_started_ns,
             "video_path": self._video_path.name,
+            "segments_path": "segments.json" if self._segments_enabled else None,
             "hand_endpoint": {
                 "host": DEFAULT_HAND_HOST,
                 "port": DEFAULT_HAND_PORT,
@@ -597,6 +693,17 @@ class DatasetRecorder:
             json.dumps(session, indent=2),
             encoding="utf-8",
         )
+        if self._segments_enabled:
+            segments = {
+                "version": 1,
+                "mode": "manual_keypress",
+                "segment_key": self._segment_key,
+                "segments": [segment.to_json() for segment in self._segments],
+            }
+            (self.output_dir / "segments.json").write_text(
+                json.dumps(segments, indent=2),
+                encoding="utf-8",
+            )
         logging.info("Dataset written to %s", self.output_dir)
 
 
@@ -605,7 +712,17 @@ def _create_parser() -> argparse.ArgumentParser:
         prog="record_quest_dataset",
         description="Record Quest camera, hand, and head streams into a dataset folder.",
     )
-    parser.add_argument("--name", required=True, help="Dataset name. Output will be ./data/{name}.")
+    parser.add_argument("--name", required=True, help="Dataset name.")
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Optional session name. When set, output will be ./data/{name}/{session}.",
+    )
+    parser.add_argument(
+        "--segments",
+        action="store_true",
+        help="Record manual task segments. Focus the preview window and press n to start the next segment.",
+    )
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="Root folder for datasets.")
     parser.add_argument("--fps", type=int, default=DEFAULT_DATASET_FPS, help="Dataset video/playback fps.")
     return parser
@@ -624,6 +741,8 @@ def _run_preview_loop(recorder: DatasetRecorder) -> None:
         if event.key == "q":
             stop_requested = True
             plt.close(figure)
+        elif event.key == "n":
+            recorder.advance_segment()
 
     figure.canvas.mpl_connect("key_press_event", _handle_key_press)
 
@@ -633,7 +752,10 @@ def _run_preview_loop(recorder: DatasetRecorder) -> None:
             if image_artist is None:
                 image_artist = axis.imshow(frame)
                 axis.axis("off")
-                axis.set_title("Quest Recorder Preview")
+                title = "Quest Recorder Preview - q stops"
+                if recorder.args.segments:
+                    title += ", n advances segment"
+                axis.set_title(title)
             else:
                 image_artist.set_data(frame)
             figure.canvas.draw_idle()
@@ -644,7 +766,7 @@ def main() -> None:
     args = _create_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    output_dir = Path(args.output_root) / args.name
+    output_dir = resolve_recording_dir(args.output_root, args.name, args.session)
     output_dir.mkdir(parents=True, exist_ok=True)
     recorder = DatasetRecorder(output_dir=output_dir, args=args)
     telemetry_server = TelemetryServer(
@@ -663,7 +785,11 @@ def main() -> None:
     camera_receiver.start()
 
     if DEFAULT_ENABLE_PREVIEW:
-        logging.info("Waiting for Quest streams. Focus the preview window and press q, or press Ctrl+C to stop recording.")
+        logging.info(
+            "Waiting for Quest streams. Focus the preview window and press q, or press Ctrl+C to stop recording."
+        )
+        if args.segments:
+            logging.info("Segments enabled. Press n in the preview window to advance to the next segment.")
     else:
         logging.info("Waiting for Quest streams. Press Ctrl+C to stop recording.")
     logging.info("ADB reverse commands:")

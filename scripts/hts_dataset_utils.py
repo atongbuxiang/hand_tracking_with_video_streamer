@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -10,6 +11,39 @@ import numpy as np
 
 _FRAME_RE = re.compile(r"\bf\s*=\s*(\d+)")
 _TIMESTAMP_RE = re.compile(r"\bt\s*=\s*(\d+)")
+
+
+def resolve_recording_dir(output_root: str | Path, name: str, session: str | None = None) -> Path:
+    dataset_dir = Path(output_root) / name
+    if session:
+        return dataset_dir / session
+    return dataset_dir
+
+
+def resolve_replay_dir(output_root: str | Path, name: str, session: str | None = None) -> Path:
+    dataset_dir = Path(output_root) / name
+    if session:
+        session_dir = dataset_dir / session
+        if not session_dir.exists():
+            raise SystemExit(f"Session not found: {session_dir}")
+        return session_dir
+
+    if not dataset_dir.exists():
+        raise SystemExit(f"Dataset not found: {dataset_dir}")
+
+    session_dirs = [
+        child
+        for child in sorted(dataset_dir.iterdir())
+        if child.is_dir() and child.name != "__MACOSX" and (child / "aligned_frames.parquet").exists()
+    ]
+    if len(session_dirs) == 1:
+        return session_dirs[0]
+    if len(session_dirs) > 1:
+        session_names = ", ".join(child.name for child in session_dirs)
+        raise SystemExit(
+            f"Dataset {dataset_dir} contains multiple sessions ({session_names}). Please choose one with --session."
+        )
+    return dataset_dir
 
 
 @dataclass
