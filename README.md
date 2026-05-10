@@ -51,6 +51,28 @@ python ./scripts/reproject_quest_dataset.py --name your_dataset_name
 python ./scripts/reproject_quest_dataset.py --name your_dataset_name --segment 3
 ```
 
+6. detect AprilTags and rewrite poses into the tag frame:
+
+```bash
+uv run python ./scripts/align_quest_dataset_apriltag.py --name your_dataset_name --marker-length-m 0.05
+```
+
+This writes `apriltag_detections.parquet`, `aligned_frames_tag.parquet`, and adds an `apriltag` block to `session.json`.
+
+7. visualize the dataset in Rerun:
+
+```bash
+uv run python ./scripts/visualize_quest_dataset_rerun.py --name your_dataset_name --spawn --frame-step 5
+```
+
+To save a Rerun recording instead of opening the viewer:
+
+```bash
+uv run python ./scripts/visualize_quest_dataset_rerun.py --name your_dataset_name --save ./data/your_dataset_name/quest_dataset_rerun.rrd --frame-step 5
+```
+
+By default, the Rerun script shows the AprilTag-aligned tag frame if `aligned_frames_tag.parquet` is available. Use `--world-space` to visualize the original dataset world frame instead.
+
 
 ## Deployment
 
