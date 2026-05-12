@@ -4,6 +4,7 @@ Usage:
     python ./scripts/reproject_quest_dataset.py --name demo
     python ./scripts/reproject_quest_dataset.py --name demo --session session_001
     python ./scripts/reproject_quest_dataset.py --name demo --segment 3
+    python ./scripts/reproject_quest_dataset.py --name demo --tag-space
     python ./scripts/reproject_quest_dataset.py --name demo --output-root ./data --fps 15
 """
 
@@ -34,6 +35,93 @@ DEFAULT_DATASET_FPS = 15
 DEFAULT_CAMERA_EYE = "left"
 DEFAULT_CAMERA_OFFSET = default_camera_offset(DEFAULT_CAMERA_EYE)
 DEFAULT_CAMERA_ROTATION_OFFSET = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+TAG_TO_PROJECT_BASIS = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+
+def _quat_to_matrix(quat: list[float] | np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float64)
+    if q.shape != (4,):
+        return np.eye(3, dtype=np.float64)
+    norm = np.linalg.norm(q)
+    if norm <= 0.0:
+        return np.eye(3, dtype=np.float64)
+    x, y, z, w = q / norm
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _matrix_to_quat(matrix: np.ndarray) -> np.ndarray:
+    m = np.asarray(matrix, dtype=np.float64)
+    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if trace > 0.0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([x, y, z, w], dtype=np.float64)
+    return quat / max(np.linalg.norm(quat), 1e-12)
+
+
+def _position_for_projection(position: list[float] | None, tag_space: bool) -> list[float] | None:
+    if position is None:
+        return None
+    pos = np.asarray(position, dtype=np.float64).reshape(3)
+    if tag_space:
+        pos = TAG_TO_PROJECT_BASIS @ pos
+    return pos.tolist()
+
+
+def _quaternion_for_projection(quaternion: list[float] | None, tag_space: bool) -> list[float] | None:
+    if quaternion is None:
+        return None
+    if not tag_space:
+        return quaternion
+    rot = TAG_TO_PROJECT_BASIS @ _quat_to_matrix(quaternion) @ TAG_TO_PROJECT_BASIS
+    return _matrix_to_quat(rot).tolist()
+
+
+def _points_for_projection(points: list[float] | None, tag_space: bool) -> list[float] | None:
+    if points is None:
+        return None
+    pts = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    if tag_space:
+        pts = (TAG_TO_PROJECT_BASIS @ pts.T).T
+    return pts.reshape(-1).tolist()
 
 
 def _draw_hand_overlay(
@@ -167,6 +255,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="Dataset root.")
     parser.add_argument("--fps", type=float, default=DEFAULT_DATASET_FPS, help="Dataset playback fps.")
+    parser.add_argument(
+        "--tag-space",
+        action="store_true",
+        help="Replay aligned_frames_tag.parquet using tag-frame pose and landmark columns.",
+    )
     return parser
 
 
@@ -177,7 +270,18 @@ def main() -> None:
     dataset_dir = resolve_replay_dir(args.output_root, args.name, args.session)
 
     session = _load_session(dataset_dir)
-    aligned_rows = pq.read_table(dataset_dir / "aligned_frames.parquet").to_pylist()
+    aligned_path = dataset_dir / ("aligned_frames_tag.parquet" if args.tag_space else "aligned_frames.parquet")
+    if not aligned_path.exists():
+        raise SystemExit(f"Aligned parquet not found: {aligned_path}")
+    aligned_rows = pq.read_table(aligned_path).to_pylist()
+    camera_position_key = "camera_position_tag" if args.tag_space else "camera_position_world"
+    camera_quaternion_key = "camera_quaternion_tag" if args.tag_space else "camera_quaternion_world"
+    head_position_key = "head_position_tag" if args.tag_space else "head_position"
+    head_quaternion_key = "head_quaternion_tag" if args.tag_space else "head_quaternion"
+    left_wrist_key = "left_wrist_position_tag" if args.tag_space else "left_wrist_position"
+    right_wrist_key = "right_wrist_position_tag" if args.tag_space else "right_wrist_position"
+    left_landmarks_key = "left_landmarks_tag" if args.tag_space else "left_landmarks_world"
+    right_landmarks_key = "right_landmarks_tag" if args.tag_space else "right_landmarks_world"
     video_path = dataset_dir / session.get("video_path", "camera.mp4")
     reader = imageio.get_reader(video_path)
     segment = _load_segment(dataset_dir, args.segment) if args.segment is not None else None
@@ -217,11 +321,11 @@ def main() -> None:
             pil_image = Image.fromarray(frame).convert("RGB")
             calibration = _resolve_intrinsics(session, pil_image.width, pil_image.height)
 
-            camera_position = row.get("camera_position_world")
-            camera_quaternion = row.get("camera_quaternion_world")
+            camera_position = row.get(camera_position_key)
+            camera_quaternion = row.get(camera_quaternion_key)
             if camera_position is None or camera_quaternion is None:
-                head_position = row.get("head_position")
-                head_quaternion = row.get("head_quaternion")
+                head_position = row.get(head_position_key)
+                head_quaternion = row.get(head_quaternion_key)
                 if head_position is None or head_quaternion is None:
                     camera_position = None
                     camera_quaternion = None
@@ -229,19 +333,22 @@ def main() -> None:
                     lens_offset_position = calibration.get("lens_offset_position") or DEFAULT_CAMERA_OFFSET.tolist()
                     lens_offset_rotation = calibration.get("lens_offset_rotation") or DEFAULT_CAMERA_ROTATION_OFFSET.tolist()
                     camera_position, camera_quaternion = camera_pose_from_head(
-                        head_position,
-                        head_quaternion,
+                        _position_for_projection(head_position, args.tag_space),
+                        _quaternion_for_projection(head_quaternion, args.tag_space),
                         lens_offset_position,
                         lens_offset_rotation,
                     )
+            else:
+                camera_position = _position_for_projection(camera_position, args.tag_space)
+                camera_quaternion = _quaternion_for_projection(camera_quaternion, args.tag_space)
 
             if camera_position is not None and camera_quaternion is not None:
                 camera_position = np.asarray(camera_position, dtype=np.float64)
                 camera_quaternion = np.asarray(camera_quaternion, dtype=np.float64)
                 _draw_hand_overlay(
                     pil_image,
-                    row.get("left_wrist_position"),
-                    row.get("left_landmarks_world"),
+                    _position_for_projection(row.get(left_wrist_key), args.tag_space),
+                    _points_for_projection(row.get(left_landmarks_key), args.tag_space),
                     camera_position,
                     camera_quaternion,
                     calibration,
@@ -250,8 +357,8 @@ def main() -> None:
                 )
                 _draw_hand_overlay(
                     pil_image,
-                    row.get("right_wrist_position"),
-                    row.get("right_landmarks_world"),
+                    _position_for_projection(row.get(right_wrist_key), args.tag_space),
+                    _points_for_projection(row.get(right_landmarks_key), args.tag_space),
                     camera_position,
                     camera_quaternion,
                     calibration,
@@ -266,6 +373,8 @@ def main() -> None:
             title = f"Quest Dataset Replay - frame {index}"
             if segment is not None:
                 title = f"Quest Dataset Replay - segment {args.segment} frame {index}"
+            if args.tag_space:
+                title += " [tag]"
             axis.set_title(title)
             display.canvas.draw_idle()
             display.canvas.flush_events()

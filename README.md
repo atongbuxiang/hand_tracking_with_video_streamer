@@ -54,10 +54,13 @@ python ./scripts/reproject_quest_dataset.py --name your_dataset_name --segment 3
 6. detect AprilTags and rewrite poses into the tag frame:
 
 ```bash
-uv run python ./scripts/align_quest_dataset_apriltag.py --name your_dataset_name --marker-length-m 0.05
+uv run python ./scripts/align_quest_dataset_apriltag.py --name your_dataset_name --marker-length-m 0.15
+uv run python ./scripts/align_quest_dataset_apriltag.py --name your_dataset_name --segment 3 --marker-length-m 0.15
 ```
 
-This writes `apriltag_detections.parquet`, `aligned_frames_tag.parquet`, and adds an `apriltag` block to `session.json`.
+This detects AprilTags only inside one `segments.json` segment, estimates the reference tag transform from that segment, then rewrites the whole aligned dataset into tag space. If `--segment` is omitted, it uses `segment_index=1`.
+It writes `apriltag_detections.parquet`, writes `aligned_frames_tag.parquet`, and adds an `apriltag` block to `session.json`.
+Converted columns are explicitly renamed, for example `camera_position_world` becomes `camera_position_tag`, and `left_landmarks_world` becomes `left_landmarks_tag`.
 
 7. visualize the dataset in Rerun:
 
