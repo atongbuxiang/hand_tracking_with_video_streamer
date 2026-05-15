@@ -4,6 +4,7 @@ Usage:
     python ./scripts/reproject_quest_dataset.py --name demo
     python ./scripts/reproject_quest_dataset.py --name demo --session session_001
     python ./scripts/reproject_quest_dataset.py --name demo --segment 3
+    python ./scripts/reproject_quest_dataset.py --name demo --start-time 8 12
     python ./scripts/reproject_quest_dataset.py --name demo --tag-space
     python ./scripts/reproject_quest_dataset.py --name demo --output-root ./data --fps 15
 """
@@ -236,6 +237,53 @@ def _load_segment(dataset_dir: Path, segment_index: int) -> dict:
     raise SystemExit(f"Segment {segment_index} not found in {segments_path}. Available segments: {available}")
 
 
+def _load_camera_frames(dataset_dir: Path) -> list[dict]:
+    camera_frames_path = dataset_dir / "camera_frames.parquet"
+    if not camera_frames_path.exists():
+        raise SystemExit(f"camera_frames.parquet not found in {dataset_dir}")
+    return pq.read_table(camera_frames_path, columns=["camera_frame_index", "camera_timestamp_ns"]).to_pylist()
+
+
+def _parse_start_time_seconds(start_time: list[int] | None) -> int | None:
+    if start_time is None:
+        return None
+    minutes, seconds = start_time
+    if minutes < 0 or seconds < 0 or seconds >= 60:
+        raise SystemExit("--start-time expects MINUTES SECONDS with 0 <= SECONDS < 60.")
+    return minutes * 60 + seconds
+
+
+def _find_start_frame_index(
+    camera_rows: list[dict],
+    start_time_seconds: int,
+    lower_frame_index: int = 0,
+) -> int:
+    if start_time_seconds <= 0:
+        return lower_frame_index
+    if not camera_rows:
+        raise SystemExit("camera_frames.parquet is empty.")
+
+    origin_timestamp_ns = camera_rows[0].get("camera_timestamp_ns")
+    if origin_timestamp_ns is None:
+        raise SystemExit("camera_frames.parquet is missing camera_timestamp_ns.")
+
+    target_timestamp_ns = int(origin_timestamp_ns) + int(start_time_seconds * 1_000_000_000)
+    for row in camera_rows:
+        frame_index = row.get("camera_frame_index")
+        timestamp_ns = row.get("camera_timestamp_ns")
+        if frame_index is None or timestamp_ns is None:
+            continue
+        frame_index = int(frame_index)
+        if frame_index < lower_frame_index:
+            continue
+        if int(timestamp_ns) >= target_timestamp_ns:
+            return frame_index
+
+    start_minutes = start_time_seconds // 60
+    start_seconds = start_time_seconds % 60
+    raise SystemExit(f"start-time {start_minutes} {start_seconds} exceeds available camera footage.")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reproject_quest_dataset",
@@ -252,6 +300,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional segment_index from segments.json to replay.",
+    )
+    parser.add_argument(
+        "--start-time",
+        nargs=2,
+        type=int,
+        metavar=("MINUTES", "SECONDS"),
+        default=None,
+        help="Optional playback start time from video start, in minutes seconds, e.g. 8 12.",
     )
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="Dataset root.")
     parser.add_argument("--fps", type=float, default=DEFAULT_DATASET_FPS, help="Dataset playback fps.")
@@ -299,6 +355,17 @@ def main() -> None:
             start_frame_index,
             end_frame_index,
         )
+    start_time_seconds = _parse_start_time_seconds(args.start_time)
+    if start_time_seconds is not None:
+        camera_rows = _load_camera_frames(dataset_dir)
+        start_frame_index = max(
+            start_frame_index,
+            _find_start_frame_index(camera_rows, start_time_seconds, start_frame_index),
+        )
+        if start_frame_index > end_frame_index:
+            start_minutes = start_time_seconds // 60
+            start_seconds = start_time_seconds % 60
+            raise SystemExit(f"start-time {start_minutes} {start_seconds} is after the selected replay range.")
 
     import matplotlib.pyplot as plt
 

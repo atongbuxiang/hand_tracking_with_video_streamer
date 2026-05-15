@@ -19,8 +19,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "pillow>=11.2.1",
     "pyarrow>=21.0.0",
-    "websockets>=16.0",
-    "rerun-sdk>=0.31.4",
+    "websockets>=16.0"
 ]
 
 [tool.setuptools]
